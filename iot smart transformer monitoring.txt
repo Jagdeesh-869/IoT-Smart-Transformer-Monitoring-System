@@ -1,0 +1,525 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <time.h>
+
+// =====================================================
+// WIFI CONFIGURATION
+// =====================================================
+const char* ssid = "Asus Tuf";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// =====================================================
+// OLED DISPLAY
+// =====================================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_SDA 21
+#define OLED_SCL 22
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// =====================================================
+// SENSORS & HARDWARE PINS
+// =====================================================
+#define TEMP_PIN 4
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
+
+#define GREEN_LED 18
+#define YELLOW_LED 19
+#define RED_LED 23
+#define BUZZER 25
+
+#define VOLTAGE_PIN 34
+#define VOLTAGE_RATIO 5.0
+
+// Thresholds
+#define TEMP_NORMAL 35.0
+#define TEMP_WARNING 45.0
+#define VOLT_NORMAL 18.0
+#define VOLT_WARNING 20.0
+
+// Historical Data Storage
+#define MAX_HISTORY 30
+float temperatureHistory[MAX_HISTORY];
+float voltageHistory[MAX_HISTORY];
+int historyCount = 0;
+
+float currentTemperature = 25.0;
+float currentVoltage = 0.0;
+String currentStatus = "HEALTHY";
+
+// =====================================================
+// DASHBOARD HTML (FAST IN-MEMORY STRING)
+// =====================================================
+const String PAGE_MAIN = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transformer Monitor</title>
+<style>
+  :root {
+    --bg-main: #0b0f19;
+    --card-bg: #131b2e;
+    --border: rgba(255, 255, 255, 0.08);
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+    --healthy: #10b981;
+    --warning: #f59e0b;
+    --critical: #f43f5e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg-main);
+    color: var(--text-main);
+    padding: 20px;
+    min-height: 100vh;
+  }
+  .container { max-width: 1050px; margin: 0 auto; }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 18px; margin-bottom: 22px; border-bottom: 1px solid var(--border);
+    flex-wrap: wrap; gap: 10px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .icon-box {
+    width: 38px; height: 38px; background: #0284c7; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .icon-box svg { width: 20px; height: 20px; fill: #fff; }
+  .brand h1 { font-size: 1.2rem; font-weight: 700; }
+  .brand p { font-size: 0.78rem; color: var(--text-muted); }
+  
+  .badge {
+    display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.05);
+    padding: 6px 14px; border-radius: 20px; font-size: 0.8rem; border: 1px solid var(--border);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warning); }
+
+  .alert-banner {
+    display: none; padding: 12px 18px; border-radius: 10px; margin-bottom: 20px;
+    font-size: 0.9rem; font-weight: 600; text-align: center;
+  }
+  .alert-banner.CRITICAL { display: block; background: rgba(244,63,94,0.2); border: 1px solid var(--critical); color: #fecdd3; }
+  .alert-banner.WARNING { display: block; background: rgba(245,158,11,0.2); border: 1px solid var(--warning); color: #fef3c7; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 22px; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+  .card-label { font-size: 0.78rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600; margin-bottom: 6px; }
+  .card-val { font-size: 2rem; font-weight: 800; }
+  .card-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
+
+  .status-pill { display: inline-block; padding: 4px 14px; border-radius: 20px; font-weight: 700; font-size: 0.95rem; margin-top: 6px; }
+  .status-pill.HEALTHY { background: rgba(16,185,129,0.15); color: var(--healthy); border: 1px solid var(--healthy); }
+  .status-pill.WARNING { background: rgba(245,158,11,0.15); color: var(--warning); border: 1px solid var(--warning); }
+  .status-pill.CRITICAL { background: rgba(244,63,94,0.15); color: var(--critical); border: 1px solid var(--critical); }
+
+  .charts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+  @media(max-width: 480px) { .charts-grid { grid-template-columns: 1fr; } }
+  
+  .chart-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+  .chart-title { font-size: 0.9rem; font-weight: 600; margin-bottom: 12px; color: var(--text-main); }
+  
+  canvas { width: 100% !important; height: 200px !important; display: block; }
+  footer { text-align: center; margin-top: 30px; font-size: 0.78rem; color: var(--text-muted); }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <div class="brand">
+      <div class="icon-box">
+        <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+      </div>
+      <div>
+        <h1>Transformer Monitor</h1>
+        <p>Real-Time IoT Telemetry System</p>
+      </div>
+    </div>
+    <div class="badge">
+      <div class="dot" id="link-dot"></div>
+      <span id="link-text">Connecting...</span>
+    </div>
+  </header>
+
+  <div id="alert" class="alert-banner"></div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-label">Core Temperature</div>
+      <div class="card-val" id="temp">-- °C</div>
+      <div class="card-sub">Normal Limit: &lt; 35.0 °C</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Line Voltage</div>
+      <div class="card-val" id="volt">-- V</div>
+      <div class="card-sub">Normal Limit: &lt; 18.0 V</div>
+    </div>
+    <div class="card">
+      <div class="card-label">System Status</div>
+      <div><span class="status-pill HEALTHY" id="status">INITIALIZING</span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">System Time</div>
+      <div class="card-val" id="time" style="font-size: 1.4rem; margin-top: 6px;">--:--:--</div>
+      <div class="card-sub">NTP Sync Active</div>
+    </div>
+  </div>
+
+  <div class="charts-grid">
+    <div class="chart-card">
+      <div class="chart-title">Temperature Trend (°C)</div>
+      <canvas id="tempChart"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Voltage Trend (V)</div>
+      <canvas id="voltChart"></canvas>
+    </div>
+  </div>
+
+  <footer>
+    ESP32 Node &bull; Auto-refreshing every 1 second &bull; Offline Dashboard
+  </footer>
+</div>
+
+<script>
+function renderChart(canvasId, data, color, fillColor) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  
+  const w = canvas.clientWidth || 400;
+  const h = canvas.clientHeight || 200;
+  canvas.width = w;
+  canvas.height = h;
+
+  ctx.clearRect(0, 0, w, h);
+  if (!data || data.length < 2) return;
+
+  let min = Math.min(...data);
+  let max = Math.max(...data);
+  if (min === max) { min -= 1; max += 1; }
+  const range = max - min;
+
+  const padL = 35, padR = 10, padT = 15, padB = 25;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.fillStyle = "#64748b";
+  ctx.font = "10px sans-serif";
+
+  for (let i = 0; i <= 3; i++) {
+    const y = padT + (plotH / 3) * i;
+    const val = (max - (range / 3) * i).toFixed(1);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - padR, y);
+    ctx.stroke();
+    ctx.fillText(val, 4, y + 3);
+  }
+
+  const points = data.map((val, idx) => {
+    return {
+      x: padL + (idx / (data.length - 1)) * plotW,
+      y: padT + plotH - ((val - min) / range) * plotH
+    };
+  });
+
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 0; i < points.length - 1; i++) {
+    const xc = (points[i].x + points[i + 1].x) / 2;
+    const yc = (points[i].y + points[i + 1].y) / 2;
+    ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
+  }
+  ctx.lineTo(points[points.length - 1].x, points[points.length - 1].y);
+  ctx.lineTo(points[points.length - 1].x, h - padB);
+  ctx.lineTo(points[0].x, h - padB);
+  ctx.closePath();
+
+  const grad = ctx.createLinearGradient(0, padT, 0, h - padB);
+  grad.addColorStop(0, fillColor);
+  grad.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 0; i < points.length - 1; i++) {
+    const xc = (points[i].x + points[i + 1].x) / 2;
+    const yc = (points[i].y + points[i + 1].y) / 2;
+    ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
+  }
+  ctx.lineTo(points[points.length - 1].x, points[points.length - 1].y);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+async function fetchTelemetry() {
+  try {
+    const res = await fetch('/data');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+
+    document.getElementById('link-text').innerText = "Live Connected";
+    document.getElementById('link-dot').style.background = "var(--healthy)";
+
+    const tempNum = Number(data.temperature) || 0;
+    const voltNum = Number(data.voltage) || 0;
+
+    document.getElementById('temp').innerText = tempNum.toFixed(1) + " °C";
+    document.getElementById('volt').innerText = voltNum.toFixed(1) + " V";
+    document.getElementById('time').innerText = data.time || "--:--:--";
+
+    const st = document.getElementById('status');
+    st.innerText = data.status || "HEALTHY";
+    st.className = `status-pill ${data.status}`;
+
+    const alert = document.getElementById('alert');
+    if (data.status === 'CRITICAL') {
+      alert.className = 'alert-banner CRITICAL';
+      alert.innerText = 'CRITICAL ALERT: Transformer Parameters Exceed Safe Threshold!';
+    } else if (data.status === 'WARNING') {
+      alert.className = 'alert-banner WARNING';
+      alert.innerText = 'WARNING: Temperature or Voltage Requires Attention.';
+    } else {
+      alert.className = 'alert-banner';
+    }
+
+    try {
+      renderChart('tempChart', data.tempHistory || [], '#38bdf8', 'rgba(56,189,248,0.25)');
+      renderChart('voltChart', data.voltHistory || [], '#10b981', 'rgba(16,185,129,0.25)');
+    } catch (chartErr) {
+      console.error("Chart error:", chartErr);
+    }
+
+  } catch (e) {
+    console.error("Telemetry error:", e);
+    document.getElementById('link-text').innerText = "Connection Error";
+    document.getElementById('link-dot').style.background = "var(--critical)";
+  }
+}
+
+fetchTelemetry();
+setInterval(fetchTelemetry, 1000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================
+// SENSOR READINGS
+// =====================================================
+void updateSensors() {
+  float t = sensors.getTempCByIndex(0);
+  if (t != DEVICE_DISCONNECTED_C && !isnan(t)) {
+    currentTemperature = t;
+  }
+  sensors.requestTemperatures();
+
+  int adcValue = analogRead(VOLTAGE_PIN);
+  float sensorVoltage = (adcValue / 4095.0) * 3.3;
+  float actualVoltage = sensorVoltage * VOLTAGE_RATIO;
+  if (!isnan(actualVoltage)) {
+    currentVoltage = actualVoltage;
+  }
+}
+
+String getTimeNow() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "Syncing Time...";
+  }
+  char buffer[20];
+  strftime(buffer, sizeof(buffer), "%I:%M:%S %p", &timeinfo);
+  return String(buffer);
+}
+
+String getStatus(float temp, float voltage) {
+  if (temp > TEMP_WARNING || voltage > VOLT_WARNING) {
+    return "CRITICAL";
+  }
+  if (temp > TEMP_NORMAL || voltage > VOLT_NORMAL) {
+    return "WARNING";
+  }
+  return "HEALTHY";
+}
+
+void updateIndicators() {
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(YELLOW_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  if (currentStatus == "HEALTHY") {
+    digitalWrite(GREEN_LED, HIGH);
+  } else if (currentStatus == "WARNING") {
+    digitalWrite(YELLOW_LED, HIGH);
+  } else {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(BUZZER, HIGH);
+  }
+}
+
+void storeReading() {
+  if (historyCount < MAX_HISTORY) {
+    temperatureHistory[historyCount] = currentTemperature;
+    voltageHistory[historyCount] = currentVoltage;
+    historyCount++;
+  } else {
+    for (int i = 0; i < MAX_HISTORY - 1; i++) {
+      temperatureHistory[i] = temperatureHistory[i + 1];
+      voltageHistory[i] = voltageHistory[i + 1];
+    }
+    temperatureHistory[MAX_HISTORY - 1] = currentTemperature;
+    voltageHistory[MAX_HISTORY - 1] = currentVoltage;
+  }
+}
+
+// =====================================================
+// WEB SERVER ROUTES
+// =====================================================
+void handleRoot() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/html", PAGE_MAIN);
+}
+
+void handleData() {
+  String json;
+  json.reserve(512);
+
+  json = "{";
+  json += "\"temperature\":" + String(currentTemperature, 1) + ",";
+  json += "\"voltage\":" + String(currentVoltage, 1) + ",";
+  json += "\"status\":\"" + currentStatus + "\",";
+  json += "\"time\":\"" + getTimeNow() + "\",";
+  json += "\"count\":" + String(historyCount) + ",";
+  
+  json += "\"tempHistory\":[";
+  for (int i = 0; i < historyCount; i++) {
+    json += String(temperatureHistory[i], 1);
+    if (i < historyCount - 1) json += ",";
+  }
+  json += "],";
+
+  json += "\"voltHistory\":[";
+  for (int i = 0; i < historyCount; i++) {
+    json += String(voltageHistory[i], 1);
+    if (i < historyCount - 1) json += ",";
+  }
+  json += "]";
+  json += "}";
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Connection", "close");
+  server.send(200, "application/json", json);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  analogReadResolution(12);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED NOT FOUND");
+  }
+
+  sensors.begin();
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.println("\nConnecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  if (MDNS.begin("transformer")) {
+    Serial.println("mDNS responder started: http://transformer.local");
+  }
+
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+
+  Serial.println("Web Server Ready!");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastSensorRead = 0;
+  if (millis() - lastSensorRead >= 1000) {
+    lastSensorRead = millis();
+
+    updateSensors();
+    currentStatus = getStatus(currentTemperature, currentVoltage);
+
+    storeReading();
+    updateIndicators();
+
+    // OLED Refresh
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("TRANSFORMER MONITOR");
+    display.setCursor(0, 14);
+    display.print("Temp: ");
+    display.print(currentTemperature, 1);
+    display.println(" C");
+
+    display.setCursor(0, 27);
+    display.print("Volt: ");
+    display.print(currentVoltage, 1);
+    display.println(" V");
+
+    display.setCursor(0, 40);
+    display.print("Time: ");
+    display.println(getTimeNow());
+
+    display.setCursor(0, 53);
+    display.print("Status: ");
+    display.print(currentStatus);
+    display.display();
+
+    Serial.printf("Temp: %.1f C | Volt: %.1f V | Status: %s\n", 
+                  currentTemperature, currentVoltage, currentStatus.c_str());
+  }
+}
